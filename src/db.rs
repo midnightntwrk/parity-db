@@ -50,7 +50,7 @@ const MAX_COMMIT_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 // of commit queue is blocked.
 const MAX_LOG_QUEUE_BYTES: i64 = 128 * 1024 * 1024;
 // Minimum size of log file before it is considered full.
-const MIN_LOG_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+const MIN_LOG_SIZE_BYTES: u64 = 16 * 1024 * 1024;
 // Number of log files to keep after flush when sync mode is disabled. Give the database some chance
 // to recover in case of crash.
 const KEEP_LOGS: usize = 16;
