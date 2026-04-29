@@ -220,6 +220,23 @@ pub struct ReindexBatch {
 }
 
 impl HashColumn {
+	/// Hint the kernel that the index chunk for `key` will be read soon, plus
+	/// the chunks for any in-flight reindex queue. Used by `Db::prefetch` /
+	/// `Db::get_many` to pipeline page faults across a batch of lookups.
+	///
+	/// Mined from NOMT's `Session::warm_up`: declare the keys you'll touch up
+	/// front and let the kernel issue the reads while you finish staging the
+	/// rest of the batch.
+	pub fn prefetch(&self, key: &Key) {
+		let tables = self.tables.read();
+		tables.index.prefetch(key);
+		for entry in &self.reindex.read().queue {
+			if let ReindexEntry::Index(r) = entry {
+				r.prefetch(key);
+			}
+		}
+	}
+
 	pub fn get(&self, key: &Key, log: &impl LogQuery) -> Result<Option<(Value, u32)>> {
 		let tables = self.tables.read();
 		let values = self.as_ref(&tables.value);

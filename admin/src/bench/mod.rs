@@ -93,6 +93,13 @@ pub struct Stress {
 	/// pruned values.
 	#[clap(long)]
 	pub reader_check_pruned: bool,
+
+	/// Reader thread batch size. `1` (default) issues one `get` per key (the
+	/// pre-prefetch baseline). `>1` accumulates N keys and submits them via
+	/// `Db::get_many`, exercising the prefetch fast path mined from NOMT's
+	/// `Session::warm_up`.
+	#[clap(long)]
+	pub read_batch_size: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -110,6 +117,7 @@ pub struct Args {
 	pub writer_commits_per_sleep: u64,
 	pub writer_sleep_time: u64,
 	pub reader_check_pruned: bool,
+	pub read_batch_size: usize,
 }
 
 impl Stress {
@@ -128,6 +136,7 @@ impl Stress {
 			writer_commits_per_sleep: self.writer_commits_per_sleep.unwrap_or(100),
 			writer_sleep_time: self.writer_sleep_time.unwrap_or(0),
 			reader_check_pruned: self.reader_check_pruned,
+			read_batch_size: self.read_batch_size.unwrap_or(1).max(1),
 		}
 	}
 }
@@ -269,6 +278,20 @@ fn writer(
 	}
 }
 
+fn pick_key(args: &Args, pool: &SizePool, rng: &mut rand::rngs::SmallRng, seed: u64) -> Key {
+	let commits = COMMITS.load(Ordering::Relaxed) as u64;
+	if args.archive || args.reader_check_pruned {
+		let num_keys = commits * COMMIT_SIZE as u64;
+		pool.key(rng.next_u64() % num_keys + seed)
+	} else {
+		let num_commit_values = (COMMIT_SIZE - COMMIT_PRUNE_SIZE) as u64;
+		let num_keys = commits * num_commit_values;
+		let mut index = rng.next_u64() % num_keys;
+		index += (index / num_commit_values + 1) * COMMIT_PRUNE_SIZE as u64;
+		pool.key(index + seed)
+	}
+}
+
 fn reader(
 	db: Arc<Db>,
 	args: Arc<Args>,
@@ -277,30 +300,28 @@ fn reader(
 	index: u64,
 	shutdown: Arc<AtomicBool>,
 ) {
-	// Query random keys while writing
 	let mut rng = rand::rngs::SmallRng::seed_from_u64(seed + index);
+	let batch_size = args.read_batch_size.max(1);
 	while !shutdown.load(Ordering::Relaxed) {
 		let commits = COMMITS.load(Ordering::Relaxed) as u64;
 		if commits == 0 {
 			continue
 		}
-		let key = if args.archive || args.reader_check_pruned {
-			let num_keys = commits * COMMIT_SIZE as u64;
-			pool.key(rng.next_u64() % num_keys + seed)
+		if batch_size <= 1 {
+			let key = pick_key(&args, &pool, &mut rng, seed);
+			match db.get(0, &key).unwrap() {
+				Some(_) => QUERIES_HIT.fetch_add(1, Ordering::SeqCst),
+				None => QUERIES_MISS.fetch_add(1, Ordering::SeqCst),
+			};
 		} else {
-			let num_commit_values = (COMMIT_SIZE - COMMIT_PRUNE_SIZE) as u64;
-			let num_keys = commits * num_commit_values;
-			let mut index = rng.next_u64() % num_keys;
-			index += (index / num_commit_values + 1) * COMMIT_PRUNE_SIZE as u64;
-			pool.key(index + seed)
-		};
-		match db.get(0, &key).unwrap() {
-			Some(_) => {
-				QUERIES_HIT.fetch_add(1, Ordering::SeqCst);
-			},
-			None => {
-				QUERIES_MISS.fetch_add(1, Ordering::SeqCst);
-			},
+			let keys: Vec<Key> =
+				(0..batch_size).map(|_| pick_key(&args, &pool, &mut rng, seed)).collect();
+			for result in db.get_many(keys.iter().map(|k| (0u8, k.as_slice()))) {
+				match result.unwrap() {
+					Some(_) => QUERIES_HIT.fetch_add(1, Ordering::SeqCst),
+					None => QUERIES_MISS.fetch_add(1, Ordering::SeqCst),
+				};
+			}
 		}
 	}
 }

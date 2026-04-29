@@ -64,6 +64,31 @@ pub fn madvise_random(map: &mut memmap2::MmapMut) {
 #[cfg(not(unix))]
 pub fn madvise_random(_map: &mut memmap2::MmapMut) {}
 
+/// Hint to the kernel that we're about to read `[offset, offset+len)` of `map`.
+/// On Unix this triggers asynchronous readahead so subsequent accesses are less
+/// likely to stall on a major page fault. No-op on other platforms or if the
+/// range is empty / out of bounds.
+///
+/// Mined from NOMT's `Session::warm_up` and QMDB's prefetcher pool: declaring
+/// pending reads up front lets the kernel pipeline I/O while the caller is still
+/// preparing the next batch.
+#[cfg(unix)]
+pub fn madvise_willneed(map: &memmap2::MmapMut, offset: usize, len: usize) {
+	if len == 0 {
+		return;
+	}
+	let Some(end) = offset.checked_add(len) else { return };
+	if end > map.len() {
+		return;
+	}
+	unsafe {
+		libc::madvise(map.as_ptr().add(offset) as _, len, libc::MADV_WILLNEED);
+	}
+}
+
+#[cfg(not(unix))]
+pub fn madvise_willneed(_map: &memmap2::MmapMut, _offset: usize, _len: usize) {}
+
 #[cfg(not(windows))]
 fn mmap(file: &std::fs::File, len: usize) -> Result<memmap2::MmapMut> {
 	#[cfg(not(test))]

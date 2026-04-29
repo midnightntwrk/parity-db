@@ -302,6 +302,18 @@ impl DbInner {
 		Ok(())
 	}
 
+	/// Hint that a key is about to be read so the kernel can pipeline the
+	/// page fault. Best-effort: silent no-op for tree columns, multitree
+	/// columns, missing files, or non-Unix platforms. Mined from NOMT's
+	/// `Session::warm_up`.
+	fn prefetch(&self, col: ColId, key: &[u8]) {
+		let Some(column) = self.columns.get(col as usize) else { return };
+		if let Column::Hash(c) = column {
+			let hashed = c.hash_key(key);
+			c.prefetch(&hashed);
+		}
+	}
+
 	fn get(&self, col: ColId, key: &[u8], external_call: bool) -> Result<Option<Value>> {
 		if self.options.columns[col as usize].multitree && external_call {
 			return Err(Error::InvalidConfiguration(
@@ -1549,6 +1561,43 @@ impl Db {
 		self.inner.get(col, key, true)
 	}
 
+	/// Hint that `key` in `col` is about to be read. The kernel issues an
+	/// asynchronous readahead on the index chunk so a subsequent `get` is less
+	/// likely to stall on a major page fault. Has no effect on tree / multitree
+	/// columns and is a no-op on non-Unix platforms.
+	///
+	/// Mined from NOMT's `Session::warm_up`. Cheap and safe to over-call —
+	/// missing pages are simply paged in slightly earlier than they otherwise
+	/// would have been.
+	pub fn prefetch(&self, col: ColId, key: &[u8]) {
+		self.inner.prefetch(col, key);
+	}
+
+	/// Look up many keys at once, with index-chunk prefetch issued in a first
+	/// pass before the lookups happen. For read-heavy workloads where the
+	/// caller knows the full key set up front (e.g. block execution that
+	/// reads every storage key it needs before computing), this lets the
+	/// kernel pipeline page faults for the whole batch instead of stalling
+	/// once per key.
+	///
+	/// Order of returned results matches input order. On non-Unix the
+	/// prefetch phase is a no-op and behaviour is identical to a sequential
+	/// `get` loop.
+	///
+	/// Mined from NOMT's two-phase session model (`warm_up` then sorted
+	/// `KeyReadWrite`) and from QMDB's prefetcher pool.
+	pub fn get_many<I, K>(&self, items: I) -> Vec<Result<Option<Value>>>
+	where
+		I: IntoIterator<Item = (ColId, K)>,
+		K: AsRef<[u8]>,
+	{
+		let items: Vec<_> = items.into_iter().collect();
+		for (col, key) in &items {
+			self.inner.prefetch(*col, key.as_ref());
+		}
+		items.into_iter().map(|(col, key)| self.inner.get(col, key.as_ref(), true)).collect()
+	}
+
 	/// Get value size by key. Returns `None` if the key does not exist.
 	pub fn get_size(&self, col: ColId, key: &[u8]) -> Result<Option<u32>> {
 		self.inner.get_size(col, key)
@@ -2610,6 +2659,58 @@ mod tests {
 		assert!(db.get(col_nb, key1.as_slice()).unwrap().is_none());
 		assert_eq!(db.get(col_nb, key2.as_slice()).unwrap(), Some(b"value2b".to_vec()));
 		assert_eq!(db.get(col_nb, key3.as_slice()).unwrap(), None);
+	}
+
+	#[test]
+	fn get_many_matches_sequential_get() {
+		// Sanity check that the prefetch fast-path returns identical results
+		// to a plain sequential `get` loop, including for missing keys and
+		// across the commit overlay / log overlay / disk transitions.
+		for stage in [
+			EnableCommitPipelineStages::CommitOverlay,
+			EnableCommitPipelineStages::LogOverlay,
+			EnableCommitPipelineStages::DbFile,
+		] {
+			let tmp = tempdir().unwrap();
+			let options = stage.options(tmp.path(), 1);
+			let db = Db::open_inner(&options, OpeningMode::Create).unwrap();
+			let writes: Vec<_> = (0u32..200)
+				.map(|i| (0u8, i.to_le_bytes().to_vec(), Some(format!("v{i}").into_bytes())))
+				.collect();
+			db.commit(writes).unwrap();
+			stage.run_stages(&db);
+
+			// `prefetch` must be safe to call on missing keys, multiple times,
+			// in any order — it's only a hint.
+			db.prefetch(0, &123u32.to_le_bytes());
+			db.prefetch(0, &9_999u32.to_le_bytes());
+			db.prefetch(0, &123u32.to_le_bytes());
+
+			let queries: Vec<(u8, Vec<u8>)> = (0u32..210)
+				.map(|i| (0u8, i.to_le_bytes().to_vec()))
+				.collect();
+			let bulk = db.get_many(queries.iter().map(|(c, k)| (*c, k.clone())));
+			let sequential: Vec<_> = queries
+				.iter()
+				.map(|(c, k)| db.get(*c, k.as_slice()).unwrap())
+				.collect();
+
+			assert_eq!(bulk.len(), sequential.len());
+			for (b, s) in bulk.into_iter().zip(sequential.into_iter()) {
+				assert_eq!(b.unwrap(), s);
+			}
+		}
+	}
+
+	#[test]
+	fn prefetch_is_noop_for_unknown_columns() {
+		// Prefetch must never panic / error on out-of-range columns or on
+		// columns that don't support point lookup. It's a hint, full stop.
+		let tmp = tempdir().unwrap();
+		let options = EnableCommitPipelineStages::Standard.options(tmp.path(), 1);
+		let db = Db::open_inner(&options, OpeningMode::Create).unwrap();
+		db.prefetch(0, b"never-inserted");
+		db.prefetch(99, b"out-of-range-column");
 	}
 
 	#[test]

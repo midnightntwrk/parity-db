@@ -5,7 +5,7 @@ use crate::{
 	column::{ColId, MIN_INDEX_BITS},
 	display::hex,
 	error::{try_io, Error, Result},
-	file::madvise_random,
+	file::{madvise_random, madvise_willneed},
 	log::{LogQuery, LogReader, LogWriter},
 	parking_lot::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard},
 	stats::{self, ColumnStats},
@@ -358,6 +358,18 @@ impl IndexTable {
 			return Ok(self.find_entry(key, sub_index, chunk))
 		}
 		Ok((Entry::empty(), 0))
+	}
+
+	/// Hint the kernel that the chunk for `key` will be read soon. Used by
+	/// `Db::prefetch` / `Db::get_many` to pipeline page faults across a batch
+	/// of keys. No-op on non-Unix or if the file isn't mmapped yet.
+	pub fn prefetch(&self, key: &Key) {
+		let key_prefix = TableKey::index_from_partial(key);
+		let chunk_index = self.chunk_index(key_prefix);
+		if let Some(map) = &*self.map.read() {
+			let offset = META_SIZE + chunk_index as usize * CHUNK_LEN;
+			madvise_willneed(map, offset, CHUNK_LEN);
+		}
 	}
 
 	pub fn entries(&self, chunk_index: u64, log: &impl LogQuery) -> Result<[Entry; CHUNK_ENTRIES]> {
