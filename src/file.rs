@@ -65,14 +65,16 @@ pub fn madvise_random(map: &mut memmap2::MmapMut) {
 pub fn madvise_random(_map: &mut memmap2::MmapMut) {}
 
 /// Hint to the kernel that we're about to read `[offset, offset+len)` of `map`.
-/// On Unix this triggers asynchronous readahead so subsequent accesses are less
-/// likely to stall on a major page fault. No-op on other platforms or if the
-/// range is empty / out of bounds.
+/// On Linux this triggers asynchronous readahead so subsequent accesses are
+/// less likely to stall on a major page fault. No-op on platforms where
+/// `MADV_WILLNEED` is either unimplemented or pays the syscall cost without
+/// triggering useful prefetch (notably macOS, where it's effectively a hint
+/// to "page in synchronously" — the opposite of what we want).
 ///
 /// Mined from NOMT's `Session::warm_up` and QMDB's prefetcher pool: declaring
 /// pending reads up front lets the kernel pipeline I/O while the caller is still
 /// preparing the next batch.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub fn madvise_willneed(map: &memmap2::MmapMut, offset: usize, len: usize) {
 	if len == 0 {
 		return;
@@ -86,7 +88,7 @@ pub fn madvise_willneed(map: &memmap2::MmapMut, offset: usize, len: usize) {
 	}
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 pub fn madvise_willneed(_map: &memmap2::MmapMut, _offset: usize, _len: usize) {}
 
 #[cfg(not(windows))]
@@ -188,6 +190,17 @@ impl TableFile {
 		let map = self.map.read();
 		let (map, _) = map.as_ref().unwrap();
 		MappedBytesGuard::new(map[offset..offset + len].to_vec())
+	}
+
+	/// Hint the kernel that `[offset, offset+len)` is about to be read or
+	/// written so the page-fault for that range can begin asynchronously.
+	/// Best-effort and silently no-op on non-Unix or before the file is
+	/// mmapped. Mined from QMDB's per-block prefetcher pool / NOMT's
+	/// session warm_up.
+	pub fn prefetch_at(&self, offset: u64, len: usize) {
+		let map = self.map.read();
+		let Some((map, _)) = map.as_ref() else { return };
+		madvise_willneed(map, offset as usize, len);
 	}
 
 	pub fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {

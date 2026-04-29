@@ -1140,6 +1140,10 @@ impl ValueTable {
 		while index >= self.file.capacity.load(Ordering::Relaxed) {
 			self.file.grow(self.entry_size)?;
 		}
+		// Prefetch the destination slot so the kernel can start the major
+		// page fault while we deserialize the entry from the log buffer.
+		// Mined from NOMT/QMDB pre-block prefetch pipelines.
+		self.file.prefetch_at(index * self.entry_size as u64, self.entry_size as usize);
 		if index == 0 {
 			let mut header = Header::default();
 			log.read(&mut header.0)?;

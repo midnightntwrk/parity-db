@@ -365,7 +365,14 @@ impl IndexTable {
 	/// of keys. No-op on non-Unix or if the file isn't mmapped yet.
 	pub fn prefetch(&self, key: &Key) {
 		let key_prefix = TableKey::index_from_partial(key);
-		let chunk_index = self.chunk_index(key_prefix);
+		self.prefetch_chunk(self.chunk_index(key_prefix));
+	}
+
+	/// Hint the kernel that the chunk at `chunk_index` will be read or written
+	/// soon. Used during `enact_plan` to pipeline destination-page loads with
+	/// log-record parsing — mined from QMDB's sharded prefetch pool, where
+	/// async readahead is issued before each block's writes are applied.
+	pub fn prefetch_chunk(&self, chunk_index: u64) {
 		if let Some(map) = &*self.map.read() {
 			let offset = META_SIZE + chunk_index as usize * CHUNK_LEN;
 			madvise_willneed(map, offset, CHUNK_LEN);
@@ -555,6 +562,10 @@ impl IndexTable {
 
 		let map = map.as_ref().unwrap();
 		let offset = META_SIZE + index as usize * CHUNK_LEN;
+		// Prefetch the destination page so the kernel can start the major page
+		// fault while we deserialize the chunk payload from the log buffer.
+		// Mined from NOMT/QMDB pre-block prefetch pipelines.
+		madvise_willneed(map, offset, CHUNK_LEN);
 		// Nasty mutable pointer cast. We do ensure that all chunks that are being written are
 		// accessed through the overlay in other threads.
 		let ptr: *mut u8 = map.as_ptr() as *mut u8;
