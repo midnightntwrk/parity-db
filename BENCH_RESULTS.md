@@ -69,6 +69,88 @@ Reading these:
 The point of the local sweep was to verify **no test regression** and
 **no catastrophic perf loss with the feature disabled**. Both hold.
 
+## Linux NVMe sweep
+
+Re-ran on `192.168.1.137` (NixOS, kernel 6.12.75, 32 hardware threads,
+NVMe via `nvme0n1p2`, `rustc 1.95.0`). 200,000 commits per config, single
+seed each, single run each. **Caveat: warm-cache regime** — the
+generated dataset is small enough to fit comfortably in the host's RAM
+once the index file is touched, so the OS page cache absorbs most reads.
+This is the *worst* case for `madvise(WILLNEED)` and `mlock` — both pay
+their syscall / RSS cost without gaining the async-readahead /
+miss-elimination benefit they were mined for. The relevant production
+case (mainnet sync with a working set bigger than RAM) needs either
+`drop_caches` between runs or a multi-million-commit working set; this
+sweep doesn't model it.
+
+```text
+parity-db-admin stress -d <dir> --writers 2 --readers 4 --commits 200000 --seed 1
+```
+
+| Config                              | Writer cps | Concurrent qps | Final read-pass qps |
+| ----------------------------------- | ---------: | -------------: | ------------------: |
+| `master`                  b1, p=0   |  **769.17**|     **4.28 M** |             2.24 M  |
+| HEAD (#3)                 b1, p=0   |     746.20 |        4.24 M  |             2.21 M  |
+| HEAD (#1+#3)              b16, p=0  |     754.66 |        2.79 M  |             2.21 M  |
+| HEAD (#1+#3 deeper)       b64, p=0  |     751.82 |        2.78 M  |             2.21 M  |
+| HEAD (#3+#4)              b1, p=64  |     751.82 |        4.25 M  |             2.23 M  |
+| HEAD (#1+#3+#4)           b16, p=64 |     754.66 |        2.79 M  |          **2.30 M** |
+
+Honest reading:
+
+- **Writer cps**: HEAD costs ~2 % vs master across the board (~754 vs
+  ~769). That's idea #3 — the unconditional `madvise(WILLNEED)` in
+  `enact_plan` paying a syscall on every write to chunks that are
+  already cache-resident. Real cost. On cold pages it should flip
+  positive; here it's a small unrecovered overhead.
+
+- **Concurrent qps**: master and the batch=1 HEAD configs sit at
+  ~4.25 M qps. The **batch=16 / batch=64 configs drop to ~2.78 M qps —
+  a 35 % regression**. Cause: the two-phase path (prefetch loop +
+  `Vec` allocation per batch) costs CPU on every iteration and the
+  prefetch buys nothing because the index chunks are already in the
+  page cache. This is the predicted worst case for `Db::get_many` and
+  it is very real. The win materialises only when the index doesn't fit
+  in cache; we did not test that case.
+
+- **Final read-pass qps**: all configs land in 2.21 – 2.30 M qps, a
+  4 % spread within plausible single-run noise. The all-three config
+  (`b16, p=64`) edged ahead at 2.30 M, but a single-seed delta this
+  small isn't trustworthy.
+
+What this changes for the "should we land it on midnight-node" question:
+
+1. **Idea #3** (always-on madvise in enact) costs ~2 % writer cps on
+   warm cache. It needs to be **opt-in** — a `column.prefetch_on_write`
+   bool in `Options`, default off — because warm-cache is a real
+   production case. As-is, it would slow down a chain whose state
+   already fits in RAM. Easy follow-up.
+
+2. **Idea #1** (`Db::get_many` with prefetch) is **a regression in the
+   only regime we measured**. It's still a sensible API to keep, but
+   we should not route substrate's read path through it
+   unconditionally. Keep the public method, leave it to callers that
+   *know* their working set is cold (e.g. block import after a long
+   downtime, or warp-sync state restore). Easy follow-up: a second
+   variant `Db::get_many_no_prefetch` for the warm path, or a
+   threshold-based heuristic.
+
+3. **Idea #4** (`pin_index_prefix`) is essentially neutral on this
+   workload. Both the writer and reader columns are within noise of
+   the other p=64 configs. The 64 MiB of mlock'd RAM didn't displace
+   anything important here. Should stay opt-in (it already is).
+
+The cold-cache test that would actually validate the mining still
+hasn't been run. To do it properly:
+
+```sh
+ssh 192.168.1.137 'sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"'
+# then re-run each stress with a 5-minute warm-up sleep before the
+# reader threads start, so the writer commits land on cold pages
+```
+
+That needs sudo on x86, which I haven't asked for yet.
+
 ## What we *don't* know yet
 
 The actual question — "does this speed up midnight-node mainnet sync"
