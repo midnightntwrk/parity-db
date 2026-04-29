@@ -1598,6 +1598,28 @@ impl Db {
 		items.into_iter().map(|(col, key)| self.inner.get(col, key.as_ref(), true)).collect()
 	}
 
+	/// Pin the first `bytes` of every hash column's primary index file in
+	/// physical RAM (best-effort `mlock`). Pass `0` to skip.
+	///
+	/// Mined from NOMT's always-resident upper bitbox levels: holding the
+	/// hot top of the hash table off the disk page cache eliminates the
+	/// major-page-fault cliff for the most frequently touched chunks. Cost
+	/// is `O(bytes * num_hash_columns)` of RSS that the OS can't reclaim.
+	///
+	/// Failures (e.g. RLIMIT_MEMLOCK) are logged as warnings and skipped —
+	/// pinning is a perf knob, not a correctness one. On non-Unix this is
+	/// a no-op.
+	pub fn pin_index_prefix(&self, bytes: usize) {
+		if bytes == 0 {
+			return;
+		}
+		for column in &self.inner.columns {
+			if let Column::Hash(c) = column {
+				c.pin_index_prefix(bytes);
+			}
+		}
+	}
+
 	/// Get value size by key. Returns `None` if the key does not exist.
 	pub fn get_size(&self, col: ColId, key: &[u8]) -> Result<Option<u32>> {
 		self.inner.get_size(col, key)
@@ -2711,6 +2733,24 @@ mod tests {
 		let db = Db::open_inner(&options, OpeningMode::Create).unwrap();
 		db.prefetch(0, b"never-inserted");
 		db.prefetch(99, b"out-of-range-column");
+	}
+
+	#[test]
+	fn pin_index_prefix_is_safe_to_over_call() {
+		// Pinning is best-effort. It must be safe to call before any data
+		// is written, with zero, with absurdly large values, and repeatedly.
+		// On systems where mlock is denied (RLIMIT_MEMLOCK / sandbox) the
+		// failure is logged and swallowed, not propagated.
+		let tmp = tempdir().unwrap();
+		let options = EnableCommitPipelineStages::Standard.options(tmp.path(), 1);
+		let db = Db::open_inner(&options, OpeningMode::Create).unwrap();
+		db.pin_index_prefix(0); // explicit no-op
+		db.pin_index_prefix(4 * 1024); // small, may or may not succeed
+		db.pin_index_prefix(usize::MAX); // clamped to map.len() internally
+		// Functionality after pin still works.
+		db.commit(vec![(0u8, b"k".to_vec(), Some(b"v".to_vec()))]).unwrap();
+		EnableCommitPipelineStages::Standard.run_stages(&db);
+		assert_eq!(db.get(0, b"k").unwrap(), Some(b"v".to_vec()));
 	}
 
 	#[test]

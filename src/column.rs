@@ -237,6 +237,13 @@ impl HashColumn {
 		}
 	}
 
+	/// Pin the first `bytes` of this column's primary index file in physical
+	/// RAM. Mines NOMT's always-resident upper-tree-levels cache. Best-effort.
+	pub fn pin_index_prefix(&self, bytes: usize) {
+		let tables = self.tables.read();
+		tables.index.pin_prefix(bytes);
+	}
+
 	pub fn get(&self, key: &Key, log: &impl LogQuery) -> Result<Option<(Value, u32)>> {
 		let tables = self.tables.read();
 		let values = self.as_ref(&tables.value);

@@ -5,7 +5,7 @@ use crate::{
 	column::{ColId, MIN_INDEX_BITS},
 	display::hex,
 	error::{try_io, Error, Result},
-	file::{madvise_random, madvise_willneed},
+	file::{madvise_random, madvise_willneed, mlock_prefix},
 	log::{LogQuery, LogReader, LogWriter},
 	parking_lot::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard},
 	stats::{self, ColumnStats},
@@ -376,6 +376,33 @@ impl IndexTable {
 		if let Some(map) = &*self.map.read() {
 			let offset = META_SIZE + chunk_index as usize * CHUNK_LEN;
 			madvise_willneed(map, offset, CHUNK_LEN);
+		}
+	}
+
+	/// Pin the first `bytes` of the index file in physical RAM. Mined from
+	/// NOMT's always-resident upper bitbox levels: by holding the top of the
+	/// hash table off disk we kill the major-page-fault cliff for the most
+	/// frequently touched chunks. Best-effort — `RLIMIT_MEMLOCK` denials
+	/// downgrade to a warn log.
+	pub fn pin_prefix(&self, bytes: usize) {
+		if bytes == 0 {
+			return;
+		}
+		let map = self.map.read();
+		let Some(map) = map.as_ref() else { return };
+		match mlock_prefix(map, bytes) {
+			Ok(0) => {},
+			Ok(pinned) => log::info!(
+				target: "parity-db",
+				"{}: pinned first {} bytes of index in RAM",
+				self.id, pinned,
+			),
+			Err(e) => log::warn!(
+				target: "parity-db",
+				"{}: failed to mlock first {} bytes of index ({}). \
+				Pinning is a perf hint and is being skipped.",
+				self.id, bytes, e,
+			),
 		}
 	}
 

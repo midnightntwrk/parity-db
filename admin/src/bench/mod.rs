@@ -100,6 +100,12 @@ pub struct Stress {
 	/// `Session::warm_up`.
 	#[clap(long)]
 	pub read_batch_size: Option<usize>,
+
+	/// Pin the first N MiB of each hash column's index file in RAM via
+	/// `mlock` after the database is opened. Mined from NOMT's
+	/// always-resident upper bitbox levels. `0` (default) disables pinning.
+	#[clap(long)]
+	pub pin_index_mib: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -118,6 +124,7 @@ pub struct Args {
 	pub writer_sleep_time: u64,
 	pub reader_check_pruned: bool,
 	pub read_batch_size: usize,
+	pub pin_index_mib: usize,
 }
 
 impl Stress {
@@ -137,6 +144,7 @@ impl Stress {
 			writer_sleep_time: self.writer_sleep_time.unwrap_or(0),
 			reader_check_pruned: self.reader_check_pruned,
 			read_batch_size: self.read_batch_size.unwrap_or(1).max(1),
+			pin_index_mib: self.pin_index_mib.unwrap_or(0),
 		}
 	}
 }
@@ -339,6 +347,9 @@ fn iter(db: Arc<Db>, shutdown: Arc<AtomicBool>) {
 }
 
 pub fn run_internal(args: Args, db: Db) {
+	if args.pin_index_mib > 0 {
+		db.pin_index_prefix(args.pin_index_mib * 1024 * 1024);
+	}
 	let args = Arc::new(args);
 	let shutdown = Arc::new(AtomicBool::new(false));
 	let db = Arc::new(db);

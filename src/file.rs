@@ -91,6 +91,32 @@ pub fn madvise_willneed(map: &memmap2::MmapMut, offset: usize, len: usize) {
 #[cfg(not(target_os = "linux"))]
 pub fn madvise_willneed(_map: &memmap2::MmapMut, _offset: usize, _len: usize) {}
 
+/// Pin the first `bytes` of `map` in physical RAM via `mlock`. Used to keep
+/// the hot top of an index file always resident, mined from NOMT's
+/// permanently-loaded upper bitbox levels (the level-2 cache).
+///
+/// Returns `Err` if `mlock` fails — pinning is a perf hint, not a
+/// correctness requirement (`RLIMIT_MEMLOCK` can deny the request on systems
+/// that haven't raised it, and that's expected). Callers log and continue.
+#[cfg(unix)]
+pub fn mlock_prefix(map: &memmap2::MmapMut, bytes: usize) -> std::io::Result<usize> {
+	if bytes == 0 || map.is_empty() {
+		return Ok(0);
+	}
+	let len = bytes.min(map.len());
+	let rc = unsafe { libc::mlock(map.as_ptr() as _, len) };
+	if rc != 0 {
+		Err(std::io::Error::last_os_error())
+	} else {
+		Ok(len)
+	}
+}
+
+#[cfg(not(unix))]
+pub fn mlock_prefix(_map: &memmap2::MmapMut, _bytes: usize) -> std::io::Result<usize> {
+	Ok(0)
+}
+
 #[cfg(not(windows))]
 fn mmap(file: &std::fs::File, len: usize) -> Result<memmap2::MmapMut> {
 	#[cfg(not(test))]
