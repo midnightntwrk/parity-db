@@ -33,7 +33,7 @@ impl<'a> SeekTo<'a> {
 #[derive(Debug)]
 pub struct BTreeIterator<'a> {
 	table: &'a BTreeTable,
-	log: &'a RwLock<crate::log::LogOverlays>,
+	log: &'a crate::log::LogOverlayContainer,
 	commit_overlay: &'a RwLock<Vec<CommitOverlay>>,
 	iter: BtreeIterBackend,
 	col: ColId,
@@ -72,7 +72,7 @@ impl<'a> BTreeIterator<'a> {
 	pub(crate) fn new(
 		table: &'a BTreeTable,
 		col: ColId,
-		log: &'a RwLock<crate::log::LogOverlays>,
+		log: &'a crate::log::LogOverlayContainer,
 		commit_overlay: &'a RwLock<Vec<CommitOverlay>>,
 	) -> Result<Self> {
 		let record_id = log.read().last_record_id(col);

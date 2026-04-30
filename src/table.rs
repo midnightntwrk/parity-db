@@ -1291,7 +1291,7 @@ impl ValueTable {
 	fn do_init_with_entry(&self, entry: &[u8]) -> Result<()> {
 		self.file.grow(self.entry_size)?;
 
-		let empty_overlays = RwLock::new(LogOverlays::with_columns(0));
+		let empty_overlays = crate::log::LogOverlayContainer::new(0);
 		let mut log = LogWriter::new(&empty_overlays, 0);
 		let at = self.overwrite_chain(&TableKey::NoHash, entry, &mut log, None, false, false)?;
 		self.complete_plan(&mut log)?;

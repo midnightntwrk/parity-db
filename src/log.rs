@@ -16,7 +16,7 @@ use std::{
 	collections::{HashMap, VecDeque},
 	convert::TryInto,
 	io::{ErrorKind, Read, Seek, Write},
-	sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+	sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
 const MAX_LOG_POOL_SIZE: usize = 16;
@@ -117,7 +117,70 @@ impl LogOverlays {
 	}
 }
 
-impl LogQuery for RwLock<LogOverlays> {
+/// Wraps the `RwLock<LogOverlays>` with a lock-free emptiness probe.
+///
+/// Profiling parity-db's read hot path (8 reader threads + 1 writer + the
+/// log-flush thread) showed ~33 % of total CPU spent in
+/// `RwLock::lock_shared_slow` and the read-side LogQuery impl, even when the
+/// overlay was logically empty. With high read concurrency, parking_lot's
+/// shared-acquire fast-path keeps falling into the slow path because the
+/// reader-counter cache line bounces between cores.
+///
+/// `nonempty` is a single atomic that mirrors "are any of the index / value /
+/// ref-count maps non-empty right now". Writers update it under the write
+/// lock with `Release` ordering; readers `Acquire`-load it before deciding
+/// whether to take the read lock at all. When the overlay is empty (the
+/// dominant case between commits in a read-heavy workload) the reader
+/// returns `None` immediately and never touches the lock's cache line.
+///
+/// Soundness: a writer that adds an entry holds the write lock during the
+/// modification and updates `nonempty` under that lock. The Release store on
+/// `nonempty` synchronises-with the reader's Acquire load. If the reader
+/// observes `nonempty == 0` it means no writer's add has been committed yet
+/// in the happens-before order, so missing the entry is correct. If the
+/// reader observes `nonempty > 0` it falls through to the locked path,
+/// which serialises with the writer normally.
+#[derive(Debug)]
+pub struct LogOverlayContainer {
+	overlay: RwLock<LogOverlays>,
+	nonempty: AtomicUsize,
+}
+
+impl LogOverlayContainer {
+	pub fn new(columns: usize) -> Self {
+		Self {
+			overlay: RwLock::new(LogOverlays::with_columns(columns)),
+			nonempty: AtomicUsize::new(0),
+		}
+	}
+
+	/// Take the inner read lock. Provided for callers (e.g. BTree iterator
+	/// setup) that need a stable view of the LogOverlays for longer than a
+	/// single LogQuery operation.
+	pub fn read(&self) -> crate::parking_lot::RwLockReadGuard<'_, LogOverlays> {
+		self.overlay.read()
+	}
+
+	/// Take the inner write lock. Used by the log-flush worker to update the
+	/// overlay; the caller MUST call `refresh_nonempty` before releasing the
+	/// guard so the readers' fast-path probe stays accurate.
+	pub fn write(&self) -> RwLockWriteGuard<'_, LogOverlays> {
+		self.overlay.write()
+	}
+
+	/// Recompute the non-empty hint from the current overlay. Cheap: O(per-table
+	/// overlay count), called only on commit and on log-enact, both off the
+	/// read hot path. Must be invoked while the caller holds the write lock
+	/// so the Release store atomically reflects the post-mutation state.
+	pub fn refresh_nonempty(&self, overlays: &LogOverlays) {
+		let total = overlays.index.iter().map(|o| o.map.len()).sum::<usize>() +
+			overlays.value.iter().map(|o| o.map.len()).sum::<usize>() +
+			overlays.ref_count.iter().map(|o| o.map.len()).sum::<usize>();
+		self.nonempty.store(total, Ordering::Release);
+	}
+}
+
+impl LogQuery for LogOverlayContainer {
 	type ValueRef<'a> = MappedBytesGuard<'a>;
 
 	fn with_index<R, F: FnOnce(&IndexChunk) -> R>(
@@ -126,23 +189,36 @@ impl LogQuery for RwLock<LogOverlays> {
 		index: u64,
 		f: F,
 	) -> Option<R> {
-		(&*self.read()).with_index(table, index, f)
+		if self.nonempty.load(Ordering::Acquire) == 0 {
+			return None
+		}
+		(&*self.overlay.read()).with_index(table, index, f)
 	}
 
 	fn value(&self, table: ValueTableId, index: u64, dest: &mut [u8]) -> bool {
-		(&*self.read()).value(table, index, dest)
+		if self.nonempty.load(Ordering::Acquire) == 0 {
+			return false
+		}
+		(&*self.overlay.read()).value(table, index, dest)
 	}
 
 	#[cfg(not(feature = "loom"))]
 	fn value_ref<'a>(&'a self, table: ValueTableId, index: u64) -> Option<Self::ValueRef<'a>> {
-		let lock =
-			parking_lot::RwLockReadGuard::try_map(self.read(), |o| o.value_ref(table, index));
+		if self.nonempty.load(Ordering::Acquire) == 0 {
+			return None
+		}
+		let lock = parking_lot::RwLockReadGuard::try_map(self.overlay.read(), |o| {
+			o.value_ref(table, index)
+		});
 		lock.ok()
 	}
 
 	#[cfg(feature = "loom")]
 	fn value_ref<'a>(&'a self, table: ValueTableId, index: u64) -> Option<Self::ValueRef<'a>> {
-		self.read().value_ref(table, index).map(|o| MappedBytesGuard::new(o.to_vec()))
+		if self.nonempty.load(Ordering::Acquire) == 0 {
+			return None
+		}
+		self.overlay.read().value_ref(table, index).map(|o| MappedBytesGuard::new(o.to_vec()))
 	}
 
 	fn ref_count<R, F: FnOnce(&RefCountChunk) -> R>(
@@ -151,7 +227,10 @@ impl LogQuery for RwLock<LogOverlays> {
 		index: u64,
 		f: F,
 	) -> Option<R> {
-		(&*self.read()).ref_count(table, index, f)
+		if self.nonempty.load(Ordering::Acquire) == 0 {
+			return None
+		}
+		(&*self.overlay.read()).ref_count(table, index, f)
 	}
 }
 
@@ -459,12 +538,12 @@ struct FlushedLog {
 
 #[derive(Debug)]
 pub struct LogWriter<'a> {
-	overlays: &'a RwLock<LogOverlays>,
+	overlays: &'a LogOverlayContainer,
 	log: LogChange,
 }
 
 impl<'a> LogWriter<'a> {
-	pub fn new(overlays: &'a RwLock<LogOverlays>, record_id: u64) -> LogWriter<'a> {
+	pub fn new(overlays: &'a LogOverlayContainer, record_id: u64) -> LogWriter<'a> {
 		LogWriter { overlays, log: LogChange::new(record_id) }
 	}
 
@@ -684,7 +763,7 @@ struct Reading {
 
 #[derive(Debug)]
 pub struct Log {
-	overlays: RwLock<LogOverlays>,
+	overlays: LogOverlayContainer,
 	appending: RwLock<Option<Appending>>,
 	reading: RwLock<Option<Reading>>,
 	read_queue: RwLock<VecDeque<(u32, std::fs::File)>>,
@@ -729,7 +808,7 @@ impl Log {
 		let next_log_id = if logs.is_empty() { 0 } else { max_log_id + 1 };
 
 		Ok(Log {
-			overlays: RwLock::new(LogOverlays::with_columns(options.columns.len())),
+			overlays: LogOverlayContainer::new(options.columns.len()),
 			appending: RwLock::new(None),
 			reading: RwLock::new(None),
 			read_queue: RwLock::default(),
@@ -806,6 +885,7 @@ impl Log {
 		for r in overlays.last_record_ids.iter_mut() {
 			*r = 0;
 		}
+		self.overlays.refresh_nonempty(&overlays);
 		self.dirty.store(false, Ordering::Relaxed);
 	}
 
@@ -866,6 +946,7 @@ impl Log {
 			total_value,
 			total_ref_count,
 		);
+		self.overlays.refresh_nonempty(&overlays);
 		appending.size += bytes;
 		self.dirty.store(true, Ordering::Relaxed);
 		Ok(bytes)
@@ -939,6 +1020,7 @@ impl Log {
 				o.map.shrink_to_fit();
 			}
 		}
+		self.overlays.refresh_nonempty(&overlays);
 	}
 
 	pub fn flush_one(&self, min_size: u64) -> Result<bool> {
@@ -1035,7 +1117,7 @@ impl Log {
 		}
 	}
 
-	pub fn overlays(&self) -> &RwLock<LogOverlays> {
+	pub fn overlays(&self) -> &LogOverlayContainer {
 		&self.overlays
 	}
 

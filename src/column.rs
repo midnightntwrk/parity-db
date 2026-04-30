@@ -8,7 +8,7 @@ use crate::{
 	display::hex,
 	error::{try_io, Error, Result},
 	index::{Address, IndexTable, PlanOutcome, TableId as IndexTableId},
-	log::{Log, LogAction, LogOverlays, LogQuery, LogReader, LogWriter},
+	log::{Log, LogAction, LogOverlayContainer, LogOverlays, LogQuery, LogReader, LogWriter},
 	multitree::{Children, NewNode, NodeAddress, NodeRef},
 	options::{ColumnOptions, Metadata, Options, DEFAULT_COMPRESSION_THRESHOLD},
 	parking_lot::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard},
@@ -269,7 +269,7 @@ impl HashColumn {
 		Ok(None)
 	}
 
-	pub fn get_size(&self, key: &Key, log: &RwLock<LogOverlays>) -> Result<Option<u32>> {
+	pub fn get_size(&self, key: &Key, log: &LogOverlayContainer) -> Result<Option<u32>> {
 		Ok(self.get(key, log)?.map(|(v, _rc)| v.len() as u32))
 	}
 
