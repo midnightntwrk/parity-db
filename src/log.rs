@@ -760,22 +760,15 @@ impl std::hash::Hasher for IdentityHash {
 	}
 }
 
-// All three overlay maps are keyed by `u64` chunk indices that are themselves
-// uniformly distributed (they're either hashes or table-position offsets). The
-// default `RandomState`/SipHash hasher std HashMap uses is overkill: it's
-// designed to mitigate hash-flooding from adversarial keys, which doesn't
-// apply when the keys are already random and only ever inserted by trusted
-// internal code. Use `BuildIdHash` (identity hashing on u64) on all three —
-// per-lookup hashing cost drops to a `mov` and the lock is held briefer,
-// reducing `lock_shared_slow` contention on the read hot path.
 #[derive(Debug, Default)]
 pub struct IndexLogOverlay {
-	pub map: HashMap<u64, (u64, u64, IndexChunk), BuildIdHash>, // index -> (record_id, modified_mask, entry)
+	pub map: HashMap<u64, (u64, u64, IndexChunk)>, // index -> (record_id, modified_mask, entry)
 }
 
+// We use identity hash for value overlay/log records so that writes to value tables are in order.
 #[derive(Debug, Default)]
 pub struct ValueLogOverlay {
-	pub map: HashMap<u64, (u64, Vec<u8>), BuildIdHash>, // index -> (record_id, entry)
+	pub map: HashMap<u64, (u64, Vec<u8>)>, // index -> (record_id, entry)
 }
 #[derive(Debug, Default)]
 pub struct ValueLogOverlayLocal {
@@ -784,7 +777,7 @@ pub struct ValueLogOverlayLocal {
 
 #[derive(Debug, Default)]
 pub struct RefCountLogOverlay {
-	pub map: HashMap<u64, (u64, u64, RefCountChunk), BuildIdHash>, // index -> (record_id, modified_mask, entry)
+	pub map: HashMap<u64, (u64, u64, RefCountChunk)>, // index -> (record_id, modified_mask, entry)
 }
 
 #[derive(Debug)]
