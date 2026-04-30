@@ -151,6 +151,112 @@ ssh 192.168.1.137 'sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"'
 
 That needs sudo on x86, which I haven't asked for yet.
 
+## Warm-cache read-path profiling
+
+After the user pushed back ("I'm more interested in warm-cache times"), I
+sampled the read hot path on x86 with `perf record --call-graph dwarf`
+on a `writers=1 readers=8 commits=50000` config. 569k samples, 4.5 GB
+trace. Top self-time symbols (master, pre-mining):
+
+```text
+14.08%  RwLock<LogOverlays> as LogQuery::value_ref
+14.00%  parity_db::index::IndexTable::get
+12.64%  blake2::Blake2bVarCore::compress
+12.49%  parking_lot::raw_rwlock::RawRwLock::lock_shared_slow
+ 6.73%  HashColumn::get
+ 6.49%  LogOverlays::with_index
+ 5.68%  ValueTable::query
+ 4.39%  DbInner::get
+ 4.14%  __memmove_avx_unaligned_erms
+```
+
+**~33 % of total CPU time lands in the LogOverlays read path.** Each
+`Db::get` takes the LogOverlays read lock twice (once for the index
+overlay, once for the value overlay). Eight readers contending on the
+RwLock cache line + the writer's periodic write lock keeps the
+shared-acquire fast-path failing into `lock_shared_slow`.
+
+### What I tried (and what worked)
+
+Three attempts, all on commits 3aa2136 → 17357d0 → 3e6a2bb (last
+reverted as 1bae0c2):
+
+1. **Global `nonempty: AtomicUsize` bypass** (3aa2136). Skip the
+   LogOverlays read lock entirely when the entire overlay is empty.
+   Profile post-fix showed `lock_shared_slow` unchanged at 12.48 % —
+   the bypass essentially never fired because the writer-active bench
+   keeps the global counter > 0.
+
+2. **Per-table `AtomicBool` bypass** (17357d0). One flag per per-table
+   overlay, kept outside the RwLock. Writers update under the write
+   lock; readers Acquire-load before locking. Idea: most individual
+   tables are empty even when *some* table has writes. Result on the
+   bench: still neutral (-0.7 % cps both configs, qps within noise).
+   Diagnosis: this bench has a single hash column, so all
+   reader threads target the same per-table overlay → per-table flags
+   degenerate to the global flag. Would only show up on a multi-column
+   workload (substrate sync: state column hot for reads, body /
+   transactions for writes).
+
+3. **Identity-hashing the global overlay maps** (3e6a2bb, REVERTED).
+   The maps key on u64 chunk indices and there's a comment in the
+   code saying "we use identity hash for value overlay/log records",
+   yet only the per-`LogWriter` local map was wired to `BuildIdHash`;
+   the global maps used SipHash. Applied `BuildIdHash` to all three.
+   **Catastrophic regression**: w=2/r=4 final qps 2.20 M → 1.18 M
+   (-46 %), concurrent qps 4.31 M → 3.54 M (-18 %). Best guess:
+   hashbrown's SwissTable metadata array uses 7 bits of the hash;
+   with raw u64 keys whose bottom bits cluster (chunk indices grow
+   sequentially) the metadata clusters too, blowing up probe length
+   under load. The local LogWriter map doesn't see this because it
+   stays small and short-lived; the global maps accumulate thousands
+   of entries between enacts. Reverted in 1bae0c2.
+
+### Net effect on this branch
+
+Mac and Linux warm-cache numbers are **within noise of master** with
+all surviving commits applied. The two surviving overlay-bypass
+commits (3aa2136 + 17357d0) are no-cost insurance — they'll fire on
+multi-column workloads and on read-mostly periods between bursts
+(post-warp-sync, idle node, etc) — but do not move this single-column
+continuously-writing bench.
+
+### Follow-ups that *might* actually help warm cache
+
+Listed in increasing radius of change:
+
+1. **`ahash` instead of SipHash on the global overlay maps.** Avoids
+   the identity-hash clustering trap while still being ~3× faster
+   than SipHash for short keys. One-line dependency add, low risk.
+   This is the next obvious thing to try.
+
+2. **Eliminate the value memmove (~4 %).** `Db::get` currently copies
+   value bytes out of the mmap into a fresh `Vec<u8>`. A
+   `Db::get_with<F>` that hands the caller a borrowed slice tied to
+   the read lock saves the copy; substrate's storage-read path can
+   often consume the bytes directly without owning them.
+
+3. **Sharded LogOverlays via `dashmap`.** Replace `RwLock<HashMap>`
+   with `DashMap` to remove reader-reader cache-line contention.
+   Bigger code surface, but the `lock_shared_slow` 12.5 % chunk is
+   the largest single line on the profile we can't cheaply skip.
+
+4. **`arc-swap` snapshot model.** Writer publishes a new
+   `Arc<LogOverlays>` per commit; readers `Arc::clone()` and read
+   without any lock. Best for read-mostly; cost is `O(N)` clone per
+   commit where N is the overlay size. Probably wins for substrate
+   sync where reads dominate during catch-up.
+
+5. **Faster key hash on hash columns.** blake2 is 12.6 % of CPU per
+   `get`. xxhash3 / siphash13 would cut this to 2-3 %. Requires a
+   versioned on-disk migration (the column's bucket layout depends
+   on the hash) — biggest blast radius but biggest single absolute
+   win.
+
+The right next step depends on whether the goal is "make this
+synthetic bench look better" (try #1, #3) or "make midnight-node
+sync faster" (real workload trace first, then #4 + #5).
+
 ## What we *don't* know yet
 
 The actual question — "does this speed up midnight-node mainnet sync"
