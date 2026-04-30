@@ -214,48 +214,84 @@ reverted as 1bae0c2):
 
 ### Net effect on this branch
 
-Mac and Linux warm-cache numbers are **within noise of master** with
-all surviving commits applied. The two surviving overlay-bypass
-commits (3aa2136 + 17357d0) are no-cost insurance — they'll fire on
-multi-column workloads and on read-mostly periods between bursts
-(post-warp-sync, idle node, etc) — but do not move this single-column
-continuously-writing bench.
+The two surviving overlay-bypass commits (3aa2136 + 17357d0) are
+no-cost insurance — they'll fire on multi-column workloads and on
+read-mostly periods between bursts (post-warp-sync, idle node, etc)
+but do not move this single-column continuously-writing bench.
 
-### Follow-ups that *might* actually help warm cache
+### v5 — ahash on the global LogOverlay maps (273f557)
 
-Listed in increasing radius of change:
+Following the identity-hash regression, the obvious follow-up was
+ahash: still randomised (so SwissTable's metadata array gets uniform
+7-bit slices), still doesn't pretend to defend against adversarial
+keys, but ~3× faster than SipHash on short keys.
 
-1. **`ahash` instead of SipHash on the global overlay maps.** Avoids
-   the identity-hash clustering trap while still being ~3× faster
-   than SipHash for short keys. One-line dependency add, low risk.
-   This is the next obvious thing to try.
+Linux NVMe sweep, single-seed:
 
-2. **Eliminate the value memmove (~4 %).** `Db::get` currently copies
+| Config | Master | v5 (ahash) | Δ |
+| ------ | -----: | ---------: | -: |
+| w=2 r=4 cps             |    758 |    746 | -1.5 % |
+| w=2 r=4 concurrent qps  | 4.27 M | **4.92 M** | **+15.2 %** |
+| w=2 r=4 final-pass qps  | 2.32 M | 2.30 M | -0.7 % |
+| w=1 r=8 cps             |    763 |    752 | -1.5 % |
+| w=1 r=8 concurrent qps  | 4.59 M | **5.58 M** | **+21.6 %** |
+| w=1 r=8 final-pass qps  | 2.04 M | **2.20 M** | **+7.8 %** |
+
+**Concurrent reader throughput goes up 15–22 %.** Writer cps drops
+~1.5 % which is the expected trade-off (readers running faster steal
+more CPU from the writer thread on a fixed-core box). Final-pass qps
+(single-threaded post-write) is within noise on the 4-reader config
+and +8 % on the 8-reader config — the 8-reader case actually benefits
+because the read pass over the warmer DB is finishing earlier, leaving
+less time for OS-cache eviction by background work.
+
+Re-profile with v5 applied confirms the win is where we expected:
+
+| Symbol | Master | v5 | Δ pp |
+| ------ | -----: | -: | --: |
+| `IndexTable::get` + `LogQuery::with_index` (combined) | 20.5 % | 13.75 % | -6.7 |
+| `LogQuery::value_ref` | 14.08 % | 12.77 % | -1.3 |
+| `lock_shared_slow` | 12.49 % | 13.33 % | +0.8 (relative shift, same wall-time pressure) |
+| `blake2` | 12.64 % | 15.43 % | +2.8 (more reads per second → more hashing per second) |
+
+The remaining ~40 % combined cost in `with_index` + `value_ref` +
+`lock_shared_slow` is the LogOverlays read lock itself. That's the
+target for follow-ups #3 / #4 below.
+
+### Remaining follow-ups (in increasing radius of change)
+
+1. ~~`ahash` on the global overlay maps.~~ **Done in 273f557, +15-22 %
+   concurrent qps.**
+
+2. **Eliminate the value memmove (~5 %).** `Db::get` currently copies
    value bytes out of the mmap into a fresh `Vec<u8>`. A
    `Db::get_with<F>` that hands the caller a borrowed slice tied to
    the read lock saves the copy; substrate's storage-read path can
-   often consume the bytes directly without owning them.
+   often consume the bytes directly without owning them. Worth doing
+   even though the synthetic bench's reader doesn't use the value
+   bytes (so won't reflect the win) — real workloads will.
 
 3. **Sharded LogOverlays via `dashmap`.** Replace `RwLock<HashMap>`
    with `DashMap` to remove reader-reader cache-line contention.
-   Bigger code surface, but the `lock_shared_slow` 12.5 % chunk is
-   the largest single line on the profile we can't cheaply skip.
+   Bigger code surface; `lock_shared_slow` is still 13 % after ahash
+   and is the largest single line on the profile we can't cheaply
+   skip. Note: in single-column workloads (this bench) all readers
+   target the same per-table shard so dashmap won't help; in
+   multi-column workloads (real substrate) it should.
 
 4. **`arc-swap` snapshot model.** Writer publishes a new
    `Arc<LogOverlays>` per commit; readers `Arc::clone()` and read
    without any lock. Best for read-mostly; cost is `O(N)` clone per
-   commit where N is the overlay size. Probably wins for substrate
-   sync where reads dominate during catch-up.
+   commit where N is the overlay size — could be net negative if
+   commits land faster than the clone amortises. Probably wins for
+   substrate sync where reads dominate during catch-up.
 
-5. **Faster key hash on hash columns.** blake2 is 12.6 % of CPU per
-   `get`. xxhash3 / siphash13 would cut this to 2-3 %. Requires a
-   versioned on-disk migration (the column's bucket layout depends
-   on the hash) — biggest blast radius but biggest single absolute
-   win.
+5. ~~Faster key hash on hash columns.~~ Off-limits — column key hash
+   is part of the on-disk format.
 
 The right next step depends on whether the goal is "make this
-synthetic bench look better" (try #1, #3) or "make midnight-node
-sync faster" (real workload trace first, then #4 + #5).
+synthetic bench look better" (try #3) or "make midnight-node sync
+faster" (real workload trace first, then #2 and #4).
 
 ## What we *don't* know yet
 
