@@ -258,6 +258,43 @@ The remaining ~40 % combined cost in `with_index` + `value_ref` +
 `lock_shared_slow` is the LogOverlays read lock itself. That's the
 target for follow-ups #3 / #4 below.
 
+## Multi-column substrate-shape sweep
+
+Added `parity-db-admin substrate-stress` (commit 73df3fc): mirrors
+midnight-node's column layout (13 polkadot columns, STATE+TX
+ref-counted+uniform+preimage, six columns LZ4-compressed) and a
+substrate-like workload — each "block" writes to HEADER, BODY,
+JUSTIFICATIONS, ~50 transactions, ~50 body-index entries, ~50 state
+entries; concurrent readers hammer STATE.
+
+This is the workload the synthetic single-column bench deliberately
+isn't. Per-table LogOverlays flags can't fire when one column owns
+all reads + writes; on this bench, readers and writers naturally
+target different per-table overlays.
+
+5000 blocks, --writers 1 --readers 8 --state-per-block 50
+--tx-per-block 50 --body-index-per-block 50, two seeds:
+
+| Metric | master | HEAD (all mining commits) | Δ |
+| ------ | -----: | ------------------------: | -: |
+| Block imports / sec   |  1393 | **1519** | **+9.0 %** |
+| Concurrent reader qps | 3.59 M | 3.77 M | +5.0 % |
+| Final read-pass qps   | 4.42 M | 4.05 M | -8.4 % |
+
+The +9 % writer win and +5 % concurrent reader win are the per-table
+flag bypass + ahash starting to pay off when reader and writer hit
+different columns: a STATE reader's `with_index` probe sees the STATE
+overlay flag as `false` (writer is busy in BODY/HEADER/TX columns) and
+returns immediately without taking the lock.
+
+The -8 % final-read regression is most likely a second-order effect of
+the faster writer: HEAD finishes writes ~9 % sooner, leaving a longer
+enact tail still draining when the timed read pass starts. The reader
+sees `nonempty == true` for slightly longer, so the lock is taken
+slightly more often during the read window. Acceptable trade-off — and
+it should reverse on a workload long enough for the enact tail to
+drain before the read measurement.
+
 ### Remaining follow-ups (in increasing radius of change)
 
 1. ~~`ahash` on the global overlay maps.~~ **Done in 273f557, +15-22 %
