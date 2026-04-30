@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 mod bench;
 mod multitree_bench;
+mod substrate_bench;
 
 /// Command line admin client entry point.
 /// Uses default column definition.
@@ -166,6 +167,10 @@ pub fn run() -> Result<(), String> {
 			let db = parity_db::Db::open_or_create(&db_options).unwrap();
 			multitree_bench::run_internal(args, db)?;
 		},
+		SubCommand::SubstrateStress(args) => {
+			let base = options.path.clone();
+			substrate_bench::run(args, base)?;
+		},
 	}
 	Ok(())
 }
@@ -228,6 +233,8 @@ pub enum SubCommand {
 	Stress(bench::Stress),
 	/// Multitree stress test.
 	MultiTreeStress(multitree_bench::MultiTreeStress),
+	/// Substrate-shape stress test (mirrors midnight-node's column layout).
+	SubstrateStress(substrate_bench::SubstrateStress),
 }
 
 impl SubCommand {
@@ -249,6 +256,7 @@ impl Cli {
 			SubCommand::Check(check) => &check.shared,
 			SubCommand::Stress(bench) => &bench.shared,
 			SubCommand::MultiTreeStress(bench) => &bench.shared,
+			SubCommand::SubstrateStress(bench) => &bench.shared,
 		}
 	}
 }
