@@ -760,15 +760,23 @@ impl std::hash::Hasher for IdentityHash {
 	}
 }
 
+// The three global overlay maps are hot in the read path. Replacing the
+// default RandomState/SipHash with ahash::RandomState (~3x faster on short
+// keys, still randomised so no SwissTable clustering) cuts overlay-map
+// hashing cost without the on-disk-format implications of changing the
+// column key hash. Identity hashing (BuildHasherDefault<IdentityHash>) was
+// also tried here and caused a -46% regression — see commit 1bae0c2 — so
+// the hasher must scramble bits even though the keys aren't adversarial.
+type ABuildHasher = ahash::RandomState;
+
 #[derive(Debug, Default)]
 pub struct IndexLogOverlay {
-	pub map: HashMap<u64, (u64, u64, IndexChunk)>, // index -> (record_id, modified_mask, entry)
+	pub map: HashMap<u64, (u64, u64, IndexChunk), ABuildHasher>, // index -> (record_id, modified_mask, entry)
 }
 
-// We use identity hash for value overlay/log records so that writes to value tables are in order.
 #[derive(Debug, Default)]
 pub struct ValueLogOverlay {
-	pub map: HashMap<u64, (u64, Vec<u8>)>, // index -> (record_id, entry)
+	pub map: HashMap<u64, (u64, Vec<u8>), ABuildHasher>, // index -> (record_id, entry)
 }
 #[derive(Debug, Default)]
 pub struct ValueLogOverlayLocal {
@@ -777,7 +785,7 @@ pub struct ValueLogOverlayLocal {
 
 #[derive(Debug, Default)]
 pub struct RefCountLogOverlay {
-	pub map: HashMap<u64, (u64, u64, RefCountChunk)>, // index -> (record_id, modified_mask, entry)
+	pub map: HashMap<u64, (u64, u64, RefCountChunk), ABuildHasher>, // index -> (record_id, modified_mask, entry)
 }
 
 #[derive(Debug)]
