@@ -7,6 +7,7 @@ use crate::{
 	db::{check::CheckDisplay, NodeChange, Operation, RcValue},
 	display::hex,
 	error::{try_io, Error, Result},
+	file::flush_parallel,
 	index::{Address, IndexTable, PlanOutcome, TableId as IndexTableId},
 	log::{Log, LogAction, LogOverlays, LogQuery, LogReader, LogWriter},
 	multitree::{Children, NewNode, NodeAddress, NodeRef},
@@ -534,14 +535,12 @@ impl HashColumn {
 
 	pub fn flush(&self) -> Result<()> {
 		let tables = self.tables.read();
-		tables.index.flush()?;
-		for t in tables.value.iter() {
-			t.flush()?;
-		}
-		if tables.ref_count.is_some() {
-			tables.get_ref_count().flush()?;
-		}
-		Ok(())
+		let values: Vec<_> = tables.value.iter().filter(|t| t.is_init()).collect();
+		flush_parallel(0..=values.len() + 1, |i| match i {
+			0 => tables.index.flush(),
+			i if i <= values.len() => values[i - 1].flush(),
+			_ => tables.ref_count.as_ref().map_or(Ok(()), RefCountTable::flush),
+		})
 	}
 
 	fn open_index(
