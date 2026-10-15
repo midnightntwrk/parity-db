@@ -1293,7 +1293,10 @@ impl DbInner {
 				let max_logs = if self.options.sync_data { MAX_LOG_FILES } else { KEEP_LOGS };
 				let dirty_logs = self.log.num_dirty_logs();
 				if !validation_mode {
-					while self.log.num_dirty_logs() > max_logs {
+					// On shutdown the cleanup worker may be joined; `kill_logs` cleans up instead.
+					while self.log.num_dirty_logs() > max_logs &&
+						!self.shutdown.load(Ordering::SeqCst)
+					{
 						log::debug!(target: "parity-db", "Waiting for log cleanup. Queued: {}", dirty_logs);
 						self.cleanup_queue_wait.wait();
 					}
@@ -1356,6 +1359,8 @@ impl DbInner {
 	fn shutdown(&self) {
 		self.shutdown.store(true, Ordering::SeqCst);
 		self.log_queue_wait.cv.notify_one();
+		// Wake a commit worker throttled on cleanup, which may outlive the cleanup worker.
+		self.cleanup_queue_wait.signal();
 		self.flush_worker_wait.signal();
 		self.log_worker_wait.signal();
 		self.commit_worker_wait.signal();
@@ -2433,6 +2438,9 @@ mod tests {
 	use std::{
 		collections::{BTreeMap, HashMap, HashSet},
 		path::Path,
+		sync::mpsc,
+		thread,
+		time::Duration,
 	};
 	use tempfile::tempdir;
 
@@ -2551,6 +2559,48 @@ mod tests {
 			db_path_last.is_dir(),
 			"A directory should have been been created (dir: {db_path_last:?})"
 		);
+	}
+
+	/// Shutdown enacts leftover logs after joining the cleanup worker: one log over the cleanup cap
+	/// must not throttle on `cleanup_queue_wait`, which nobody is left to signal.
+	#[test]
+	fn test_drop_with_full_cleanup_queue() {
+		for sync in [false, true] {
+			let tmp = tempdir().unwrap();
+			let mut options = EnableCommitPipelineStages::LogOverlay.options(tmp.path(), 1);
+			(options.sync_wal, options.sync_data) = (sync, sync);
+			let db = Db::open_or_create(&options).unwrap();
+			let cap = if sync { super::MAX_LOG_FILES } else { super::KEEP_LOGS };
+			let parked = u8::try_from(cap + 1).unwrap();
+			let commit_and_rotate = |i: u8| {
+				db.commit::<_, Vec<u8>>(vec![(0, vec![i], Some(vec![i]))]).unwrap();
+				while db.inner.process_commits(&db.inner).unwrap() {}
+				assert!(db.inner.log.flush_one(0).unwrap(), "each commit should rotate a log");
+			};
+
+			for i in 0..parked {
+				commit_and_rotate(i);
+				while db.inner.enact_logs(false).unwrap() {} // enact the record
+				while db.inner.enact_logs(false).unwrap() {} // EOF parks the log for cleanup
+			}
+			assert_eq!(db.inner.log.num_dirty_logs(), cap + 1, "cleanup queue should be over cap");
+			// Left for shutdown to enact, past the full queue.
+			commit_and_rotate(parked);
+
+			let (done, wait) = mpsc::channel();
+			thread::spawn(move || {
+				drop(db);
+				done.send(())
+			});
+			let res = wait.recv_timeout(Duration::from_secs(20));
+			assert_eq!(res, Ok(()), "drop deadlocked or panicked (sync={sync})");
+
+			options.with_background_thread = true;
+			let db = Db::open(&options).unwrap();
+			for i in 0..=parked {
+				assert_eq!(db.get(0, &[i]).unwrap(), Some(vec![i]), "key {i} lost across drop");
+			}
+		}
 	}
 
 	#[test]
