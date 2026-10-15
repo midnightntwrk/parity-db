@@ -5,6 +5,7 @@
 
 use crate::{
 	error::{try_io, Result},
+	mmap::Mmap,
 	parking_lot::RwLock,
 	table::TableId,
 };
@@ -87,40 +88,11 @@ fn disable_read_ahead(_file: &std::fs::File) -> std::io::Result<()> {
 	Ok(())
 }
 
-#[cfg(unix)]
-pub fn madvise_random(map: &mut memmap2::MmapMut) {
-	unsafe {
-		libc::madvise(map.as_mut_ptr() as _, map.len(), libc::MADV_RANDOM);
-	}
-}
-
-#[cfg(not(unix))]
-pub fn madvise_random(_map: &mut memmap2::MmapMut) {}
-
-#[cfg(not(windows))]
-fn mmap(file: &std::fs::File, len: usize) -> Result<memmap2::MmapMut> {
-	#[cfg(not(test))]
-	const RESERVE_ADDRESS_SPACE: usize = 1024 * 1024 * 1024; // 1 Gb
-														  // Use a different value for tests to work around docker limits on the test machine.
-	#[cfg(test)]
-	const RESERVE_ADDRESS_SPACE: usize = 64 * 1024 * 1024; // 64 Mb
-
-	let map_len = len + RESERVE_ADDRESS_SPACE;
-	let mut map = try_io!(unsafe { memmap2::MmapOptions::new().len(map_len).map_mut(file) });
-	madvise_random(&mut map);
-	Ok(map)
-}
-
-#[cfg(windows)]
-fn mmap(file: &std::fs::File, _len: usize) -> Result<memmap2::MmapMut> {
-	Ok(try_io!(unsafe { memmap2::MmapOptions::new().map_mut(file) }))
-}
-
 const GROW_SIZE_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug)]
 pub struct TableFile {
-	pub map: RwLock<Option<(memmap2::MmapMut, std::fs::File)>>,
+	pub map: RwLock<Option<(Mmap, std::fs::File)>>,
 	pub path: std::path::PathBuf,
 	pub capacity: AtomicU64,
 	pub id: TableId,
@@ -149,7 +121,7 @@ impl TableFile {
 			} else {
 				capacity = len / entry_size as u64;
 			}
-			let map = mmap(&file, len as usize)?;
+			let map = Mmap::map_growable(&file, len as usize)?;
 			Some((map, file))
 		};
 		Ok(TableFile {
@@ -176,17 +148,17 @@ impl TableFile {
 		let offset = offset as usize;
 		let map = self.map.read();
 		let (map, _) = map.as_ref().unwrap();
-		buf.copy_from_slice(&map[offset..offset + buf.len()]);
+		map.read_at(buf, offset);
 		Ok(())
 	}
 
 	#[cfg(not(feature = "loom"))]
-	pub fn slice_at(&self, offset: u64, len: usize) -> MappedBytesGuard {
+	pub fn slice_at(&self, offset: u64, len: usize) -> MappedBytesGuard<'_> {
 		let offset = offset as usize;
 		let map = self.map.read();
 		parking_lot::RwLockReadGuard::map(map, |map| {
 			let (map, _) = map.as_ref().unwrap();
-			&map[offset..offset + len]
+			map.slice(offset, len)
 		})
 	}
 
@@ -195,7 +167,7 @@ impl TableFile {
 		let offset = offset as usize;
 		let map = self.map.read();
 		let (map, _) = map.as_ref().unwrap();
-		MappedBytesGuard::new(map[offset..offset + len].to_vec())
+		MappedBytesGuard::new(map.slice(offset, len).to_vec())
 	}
 
 	pub fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
@@ -203,14 +175,10 @@ impl TableFile {
 		let (map, _) = map.as_ref().unwrap();
 		let offset = offset as usize;
 
-		// Nasty mutable pointer cast. We do ensure that all chunks that are being written are
-		// accessed through the overlay in other threads.
-		let ptr: *mut u8 = map.as_ptr() as *mut u8;
-		let data: &mut [u8] = unsafe {
-			let ptr = ptr.add(offset);
-			std::slice::from_raw_parts_mut(ptr, buf.len())
-		};
-		data.copy_from_slice(buf);
+		// SAFETY: Writes happen under a shared lock, but all entries that are being written are
+		// accessed through the log overlay in other threads, so no other slice of this range
+		// exists.
+		unsafe { map.write_at(buf, offset) };
 		Ok(())
 	}
 
@@ -221,7 +189,7 @@ impl TableFile {
 				let file = self.create_file()?;
 				let len = GROW_SIZE_BYTES;
 				try_io!(file.set_len(len));
-				let map = mmap(&file, 0)?;
+				let map = Mmap::map_growable(&file, 0)?;
 				*map_and_file = Some((map, file));
 				len
 			},
@@ -229,9 +197,9 @@ impl TableFile {
 				let new_len = try_io!(file.metadata()).len() + GROW_SIZE_BYTES;
 				try_io!(file.set_len(new_len));
 				if map.len() < new_len as usize {
-					let new_map = mmap(&file, new_len as usize)?;
+					let new_map = Mmap::map_growable(file, new_len as usize)?;
 					let old_map = std::mem::replace(map, new_map);
-					try_io!(old_map.flush());
+					old_map.flush()?;
 				}
 				new_len
 			},
@@ -243,7 +211,7 @@ impl TableFile {
 
 	pub fn flush(&self) -> Result<()> {
 		if let Some((map, _)) = self.map.read().as_ref() {
-			try_io!(map.flush());
+			map.flush()?;
 		}
 		Ok(())
 	}

@@ -508,7 +508,7 @@ impl DbInner {
 		}
 	}
 
-	fn btree_iter(&self, col: ColId) -> Result<BTreeIterator> {
+	fn btree_iter(&self, col: ColId) -> Result<BTreeIterator<'_>> {
 		match &self.columns[col as usize] {
 			Column::Hash(_column) =>
 				Err(Error::InvalidConfiguration("Not an indexed column.".to_string())),
@@ -1294,8 +1294,11 @@ impl DbInner {
 				let max_logs = if self.options.sync_data { MAX_LOG_FILES } else { KEEP_LOGS };
 				let dirty_logs = self.log.num_dirty_logs();
 				if !validation_mode {
-					while self.log.num_dirty_logs() > max_logs {
+					while !self.shutdown.load(Ordering::Relaxed) &&
+						self.log.num_dirty_logs() > max_logs
+					{
 						log::debug!(target: "parity-db", "Waiting for log cleanup. Queued: {}", dirty_logs);
+						self.cleanup_worker_wait.signal();
 						self.cleanup_queue_wait.wait();
 					}
 				}
@@ -1553,7 +1556,7 @@ impl Db {
 
 	/// Iterate over all ordered key-value pairs. Only supported for columns configured with
 	/// `btree_indexed`.
-	pub fn iter(&self, col: ColId) -> Result<BTreeIterator> {
+	pub fn iter(&self, col: ColId) -> Result<BTreeIterator<'_>> {
 		self.inner.btree_iter(col)
 	}
 
@@ -1606,7 +1609,9 @@ impl Db {
 	///
 	/// This method passes values as `Arc<Vec<u8>>` potentially eliminating an extra copy.
 	#[cfg(feature = "arc")]
-	#[deprecated(note = "This method will be removed in future versions. Use `commit_changes_bytes` instead")]
+	#[deprecated(
+		note = "This method will be removed in future versions. Use `commit_changes_bytes` instead"
+	)]
 	pub fn commit_changes_shared<I>(&self, tx: I) -> Result<()>
 	where
 		I: IntoIterator<Item = (ColId, Operation<Vec<u8>, Arc<Vec<u8>>>)>,
@@ -3079,7 +3084,8 @@ mod tests {
 		let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
 		let mut data = Vec::<(Vec<u8>, Option<Vec<u8>>)>::new();
 		for i in 0..size {
-			let nb_delete: u32 = rng.next_u32(); // should be out of loop, yet it makes alternance insert/delete in some case.
+			let nb_delete: u32 = rng.next_u32(); // should be out of loop, yet it makes alternance
+												 // insert/delete in some case.
 			let nb_delete = (nb_delete as usize % size) / 2;
 			let mut key = vec![0u8; key_size];
 			rng.fill_bytes(&mut key[..]);

@@ -692,7 +692,8 @@ pub type ValueLogOverlayLocal = ValueLogOverlay<BuildIdHash>;
 
 #[derive(Debug, Default)]
 pub struct RefCountLogOverlay<S: BuildHasher + Default = OverlayHasher> {
-	pub map: HashMap<u64, (u64, u64, RefCountChunk), S>, // index -> (record_id, modified_mask, entry)
+	pub map: HashMap<u64, (u64, u64, RefCountChunk), S>, /* index -> (record_id, modified_mask,
+	                                                      * entry) */
 }
 
 #[derive(Debug)]
