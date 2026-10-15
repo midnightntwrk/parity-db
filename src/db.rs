@@ -25,6 +25,7 @@ use crate::{
 		ReindexBatch, ValueIterState,
 	},
 	error::{try_io, Error, Result},
+	file::flush_parallel,
 	hash::IdentityBuildHasher,
 	index::{Address, PlanOutcome},
 	log::{Log, LogAction},
@@ -1321,9 +1322,7 @@ impl DbInner {
 		let num_cleanup = self.log.num_dirty_logs();
 		let result = if num_cleanup > keep_logs {
 			if self.options.sync_data {
-				for c in self.columns.iter() {
-					c.flush()?;
-				}
+				flush_parallel(&self.columns, Column::flush)?;
 			}
 			self.log.clean_logs(num_cleanup - keep_logs)?
 		} else {
@@ -1334,9 +1333,7 @@ impl DbInner {
 	}
 
 	fn clean_all_logs(&self) -> Result<()> {
-		for c in self.columns.iter() {
-			c.flush()?;
-		}
+		flush_parallel(&self.columns, Column::flush)?;
 		let num_cleanup = self.log.num_dirty_logs();
 		self.log.clean_logs(num_cleanup)?;
 		Ok(())

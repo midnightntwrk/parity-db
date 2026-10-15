@@ -6,6 +6,7 @@ use crate::{
 	column::{ColId, Column, TablesRef},
 	compress::Compress,
 	error::{Error, Result},
+	file::flush_parallel,
 	index::Address,
 	log::{LogAction, LogQuery, LogReader, LogWriter},
 	options::{Metadata, Options, DEFAULT_COMPRESSION_THRESHOLD},
@@ -190,10 +191,7 @@ impl BTreeTable {
 
 	pub fn flush(&self) -> Result<()> {
 		let tables = self.tables.read();
-		for t in tables.iter() {
-			t.flush()?;
-		}
-		Ok(())
+		flush_parallel(tables.iter().filter(|t| t.is_init()), ValueTable::flush)
 	}
 
 	pub fn get(key: &[u8], log: &impl LogQuery, values: TablesRef) -> Result<Option<Vec<u8>>> {

@@ -9,7 +9,40 @@ use crate::{
 	parking_lot::RwLock,
 	table::TableId,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+	panic,
+	sync::atomic::{AtomicU64, Ordering},
+	thread,
+};
+
+/// Runs `flush` on every item, each on its own scoped thread. Waits for all of them; a panic
+/// is re-raised in preference to any error, else the first error in iteration order is returned.
+///
+/// On Linux each `msync`/`fsync` of a dirty file ends in a device cache flush, so serial calls
+/// pay one flush latency apiece. Issued concurrently, the block layer coalesces them. With
+/// `sync_data` on, one thread per table rather than a small pool is what made the difference
+/// (block import on ext4/NVMe: ~3x; capping at 8 or 16 threads lost most of it). Callers nest
+/// it, so a flush spawns about one thread per column plus one per table file. A spawn that
+/// fails (thread limit) flushes inline instead of panicking. Serial under loom, which cannot
+/// model native threads.
+pub fn flush_parallel<T: Copy + Send>(
+	items: impl IntoIterator<Item = T>,
+	flush: impl Fn(T) -> Result<()> + Sync,
+) -> Result<()> {
+	if cfg!(feature = "loom") {
+		return items.into_iter().try_for_each(flush)
+	}
+	let flush = &flush;
+	thread::scope(|s| {
+		let jobs: Vec<_> = items
+			.into_iter()
+			.map(|t| thread::Builder::new().spawn_scoped(s, move || flush(t)).map_err(|_| flush(t)))
+			.collect();
+		let joined: thread::Result<Vec<_>> =
+			jobs.into_iter().map(|job| job.map_or_else(Ok, |t| t.join())).collect();
+		joined.unwrap_or_else(|p| panic::resume_unwind(p)).into_iter().collect()
+	})
+}
 
 trait OpenOptionsExt {
 	fn disable_read_ahead(&mut self) -> &mut Self;
